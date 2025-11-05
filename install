@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# install — Arch USB auto-install (SanDisk 512Go) + first-boot full setup
+# © Seung-Ju. Utilisation : bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/install)
+
+set -euo pipefail
+say(){ echo -e "\n\033[1;32m==>\033[0m $*\n"; }
+die(){ echo -e "\n\033[1;31m[ERREUR]\033[0m $*\n"; exit 1; }
+
+# ====== Réglages par défaut ======
+USER_NAME="seungju"
+USER_PASS="arch"
+ROOT_PASS="arch"
+HOSTNAME="arch-usb"
+TZ="Europe/Paris"
+LOCALE_MAIN="fr_FR.UTF-8"
+KEYMAP="fr"   # console
+# ================================
+
+[ "$(id -u)" -eq 0 ] || die "Lance en root (sur l'ISO, tu es déjà root)."
+
+say "Test réseau"
+ping -c1 archlinux.org >/dev/null 2>&1 || die "Pas d'accès réseau. Connecte le Wi-Fi (iwctl) ou Ethernet, puis relance."
+
+timedatectl set-ntp true
+
+say "Détection SanDisk 512Go (≈476 GiB), exclusion de la clé ISO"
+# Candidats : disques amovibles SanDisk ~476G; on exclut celui qui contient 'ARCH'/'ARCHISO'
+mapfile -t CAND < <(lsblk -dn -o NAME,SIZE,MODEL,TRAN,RM | awk '
+  /SanDisk/ && ($2 ~ /47[0-9]G|46[0-9]G|476G|465GiB/) {print $1}')
+# Exclure le device archiso
+FILTERED=()
+for n in "${CAND[@]}"; do
+  dev="/dev/$n"
+  if ! lsblk -no LABEL "$dev"* 2>/dev/null | grep -Ei 'ARCH|ARCHISO' >/dev/null; then
+    FILTERED+=("$n")
+  fi
+done
+CAND=("${FILTERED[@]}")
+
+[ "${#CAND[@]}" -eq 1 ] || die "Impossible d'identifier de façon sûre la SanDisk 512Go (trouvées: ${#CAND[@]}). Débranche les autres disques externes et relance."
+TARGET="/dev/${CAND[0]}"
+say "Cible retenue : $TARGET"
+
+# Partitionnement GPT : EFI 1G + ROOT (reste)
+say "Partitionnement & formatage (EFFACE TOUT sur $TARGET)"
+wipefs -af "$TARGET"
+sgdisk -Zo "$TARGET"
+partprobe "$TARGET"
+sgdisk -n1:0:+1G -t1:ef00 -c1:"EFI"  "$TARGET"
+sgdisk -n2:0:0    -t2:8300 -c2:"ROOT" "$TARGET"
+partprobe "$TARGET"
+
+P1="${TARGET}1"
+P2="${TARGET}2"
+
+mkfs.vfat -F32 -n EFI "$P1"
+mkfs.btrfs -f -L ARCHUSB "$P2"
+
+# Sous-volumes
+mount "$P2" /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@pkg
+btrfs subvolume create /mnt/@log
+btrfs subvolume create /mnt/@snapshots
+umount /mnt
+
+# Montage
+mount -o subvol=@,compress=zstd:3,noatime "$P2" /mnt
+mkdir -p /mnt/{boot,home,var/cache/pacman/pkg,var/log,.snapshots}
+mount -o subvol=@home,compress=zstd:3,noatime      "$P2" /mnt/home
+mount -o subvol=@pkg,compress=zstd:3,noatime       "$P2" /mnt/var/cache/pacman/pkg
+mount -o subvol=@log,compress=zstd:3,noatime       "$P2" /mnt/var/log
+mount -o subvol=@snapshots,compress=zstd:3,noatime "$P2" /mnt/.snapshots
+mount "$P1" /mnt/boot
+
+# Base Arch
+say "Installation base"
+pacman -Sy --noconfirm
+pacstrap -K /mnt base base-devel linux linux-headers linux-firmware \
+  btrfs-progs networkmanager sudo nano vim git bash-completion man-db man-pages
+
+genfstab -U /mnt >> /mnt/etc/fstab
+
+say "Configuration système (FR, AZERTY, Paris, hostname)"
+arch-chroot /mnt /bin/bash <<CHROOT
+set -e
+echo "$HOSTNAME" > /etc/hostname
+ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
+hwclock --systohc
+
+sed -i 's/^#${LOCALE_MAIN} ${LOCALE_MAIN##* }/${LOCALE_MAIN} ${LOCALE_MAIN##* }/' /etc/locale.gen
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=$LOCALE_MAIN" > /etc/locale.conf
+echo "KEYMAP=$KEYMAP"    > /etc/vconsole.conf
+
+systemctl enable NetworkManager
+
+# Utilisateur + mots de passe
+useradd -m -G wheel,video,audio,storage,lp -s /bin/bash $USER_NAME
+echo "$USER_NAME:$USER_PASS" | chpasswd
+echo "root:$ROOT_PASS" | chpasswd
+
+# Sudo NOPASSWD pour wheel
+sed -i 's/^# %wheel ALL=(ALL:ALL) NOPASSWD: ALL/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
+
+# GRUB UEFI portable
+pacman -S --noconfirm grub efibootmgr dosfstools
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=ARCHUSB --recheck --removable
+grub-mkconfig -o /boot/grub/grub.cfg
+
+# --- Script first-boot auto-setup (inline) ---
+install -d -m 755 /usr/local/bin
+cat > /usr/local/bin/setup-arch-firstboot.sh <<'EOFSETUP'
+#!/usr/bin/env bash
+set -euo pipefail
+say(){ echo -e "\n\033[1;32m==>\033[0m $*\n"; }
+
+U="$USER_NAME"
+HOME_U="/home/$USER_NAME"
+
+say "MAJ + multilib"
+sed -i 's/^#\[multilib\]/[multilib]/' /etc/pacman.conf
+sed -i '/^\[multilib\]/{n;s/^#Include/Include/}' /etc/pacman.conf
+pacman -Syyu --noconfirm
+
+say "Paquets fondamentaux (réseau, audio, BT, fichiers, utilitaires)"
+pacman -S --needed --noconfirm \
+  linux-headers dkms \
+  networkmanager network-manager-applet \
+  pipewire pipewire-alsa pipewire-audio pipewire-pulse pipewire-jack wireplumber pavucontrol \
+  bluez bluez-utils blueman \
+  ntfs-3g exfatprogs dosfstools udiskie gvfs gvfs-mtp \
+  xdg-user-dirs xdg-desktop-portal xdg-desktop-portal-kde \
+  htop neofetch tmux unzip zip curl wget rsync \
+  lm_sensors nvtop flatpak
+
+systemctl enable --now NetworkManager
+systemctl enable --now bluetooth || true
+
+say "Pilotes NVIDIA (RTX 4060, DKMS) + 32-bit"
+pacman -S --needed --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils nvidia-settings opencl-nvidia
+
+say "KDE Plasma + SDDM + apps de base"
+pacman -S --needed --noconfirm \
+  plasma-desktop sddm konsole dolphin kate ark gwenview \
+  plasma-wayland-session kde-graphics-thumbnailers ffmpegthumbs \
+  firefox power-profiles-daemon
+systemctl enable sddm
+systemctl enable power-profiles-daemon
+
+say "Gaming (Steam, GameMode, MangoHud, Vulkan)"
+pacman -S --needed --noconfirm \
+  steam gamescope gamemode mangohud vulkan-tools vulkan-icd-loader lib32-vulkan-icd-loader
+systemctl enable --now gamemoded || true
+
+say "Apps (repo): Discord, Opera, Tor (daemon)"
+pacman -S --needed --noconfirm discord opera tor
+
+say "BlackArch repo + outils"
+if ! grep -qi '^\[blackarch\]' /etc/pacman.conf; then
+  curl -fsSL https://blackarch.org/strap.sh -o /tmp/strap.sh
+  chmod +x /tmp/strap.sh
+  /tmp/strap.sh
+fi
+pacman -Syy --noconfirm
+pacman -S --needed --noconfirm blackarch-keyring \
+  nmap metasploit aircrack-ng john hashcat wireshark-qt gobuster sqlmap hydra seclists wordlists
+
+say "AUR helper (yay) + AUR apps"
+if ! sudo -u "$U" command -v yay >/dev/null 2>&1; then
+  sudo -u "$U" bash -lc '
+    set -e
+    cd ~
+    git clone --depth=1 https://aur.archlinux.org/yay.git
+    cd yay && makepkg -si --noconfirm
+  '
+fi
+sudo -u "$U" yay -S --needed --noconfirm torbrowser-launcher goverlay-bin deezer || true
+
+say "Flathub"
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+
+say "Autostart udiskie (auto-mount SSD externe Steam)"
+install -d -m 755 "$HOME_U/.config/autostart"
+cat > "$HOME_U/.config/autostart/udiskie.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=udiskie
+Exec=udiskie --tray
+X-GNOME-Autostart-enabled=true
+EOF
+chown -R "$U:$U" "$HOME_U/.config/autostart"
+
+say "Bluetooth: AutoEnable + A2DP par défaut"
+install -Dm644 /dev/stdin /etc/bluetooth/main.conf <<'EOF'
+[General]
+Name = ArchBox
+Class = 0x000100
+DiscoverableTimeout = 0
+PairableTimeout = 0
+ControllerMode = dual
+FastConnectable = true
+AutoEnable = true
+EOF
+systemctl restart bluetooth || true
+
+install -d /usr/share/wireplumber/main.lua.d
+cat > /usr/share/wireplumber/main.lua.d/51-autoswitch-bt.lua <<'EOF'
+-- Force A2DP sur connexion des périphériques Bluetooth
+rule = {
+  matches = { { { "device.name", "matches", "bluez_card.*" }, }, },
+  apply_properties = { ["device.profile"] = "a2dp-sink", }
+}
+table.insert(alsa_monitor.rules, rule)
+EOF
+
+# PipeWire services côté user (seront actifs à la session)
+runuser -l "$U" -c 'systemctl --user enable --now pipewire pipewire-pulse wireplumber' || true
+
+say "MangoHud configuration"
+runuser -l "$U" -c 'mkdir -p ~/.config/MangoHud'
+cat > "$HOME_U/.config/MangoHud/MangoHud.conf" <<'EOF'
+fps_limit=0
+toggle_hud=Shift_R+F12
+toggle_fps_limit=Shift_R+F11
+position=top-right
+font_size=22
+background_alpha=0.3
+cpu_stats
+gpu_stats
+gpu_temp
+cpu_temp
+core_load
+ram
+vram
+io_read
+io_write
+frame_timing=1
+frametime
+hud_no_margin
+alpha=1.0
+gl_vsync
+arch
+engine_version
+gpu_core_clock
+gpu_mem_clock
+EOF
+chown -R "$U:$U" "$HOME_U/.config/MangoHud"
+
+say "Profil Konsole BlackArch (noir/rouge)"
+runuser -l "$U" -c 'mkdir -p ~/.local/share/konsole'
+cat > "$HOME_U/.local/share/konsole/BlackArch.colorscheme" <<'EOF'
+[General]
+Description=BlackArch
+Opacity=1
+[Background]
+Color=0,0,0
+[Foreground]
+Color=255,64,64
+[Bold]
+Color=255,0,0
+[Color0]
+Color=0,0,0
+[Color1]
+Color=255,0,64
+[Color2]
+Color=0,255,128
+[Color3]
+Color=255,128,0
+[Color4]
+Color=128,128,255
+[Color5]
+Color=255,64,192
+[Color6]
+Color=64,255,255
+[Color7]
+Color=224,224,224
+[Color8]
+Color=64,64,64
+[Color9]
+Color=255,64,64
+[Color10]
+Color=64,255,160
+[Color11]
+Color=255,192,64
+[Color12]
+Color=160,160,255
+[Color13]
+Color=255,96,224
+[Color14]
+Color=96,255,255
+[Color15]
+Color=255,255,255
+EOF
+cat > "$HOME_U/.local/share/konsole/BlackArch.profile" <<'EOF'
+[Appearance]
+ColorScheme=BlackArch
+Font=FiraCode Nerd Font,12,-1,5,50,0,0,0,0,0
+[General]
+Name=BlackArch
+Parent=FALLBACK/
+EOF
+mkdir -p "$HOME_U/.config"
+grep -q "^DefaultProfile=" "$HOME_U/.config/konsolerc" 2>/dev/null || \
+  printf "[Desktop]\nDefaultProfile=BlackArch.profile\n" >> "$HOME_U/.config/konsolerc"
+chown -R "$U:$U" "$HOME_U/.local" "$HOME_U/.config"
+
+say "Steam: compat dir"
+runuser -l "$U" -c 'mkdir -p ~/.steam/steam/compatibilitytools.d'
+
+say "Capteurs"
+yes | sensors-detect || true
+
+say "Désactivation du service first-boot et redémarrage"
+systemctl disable first-boot-setup.service || true
+reboot
+EOFSETUP
+chmod +x /usr/local/bin/setup-arch-firstboot.sh
+
+# Service first-boot
+cat > /etc/systemd/system/first-boot-setup.service <<'EOF'
+[Unit]
+Description=First boot full setup (NVIDIA, KDE, apps, BlackArch, etc.)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-arch-firstboot.sh
+RemainAfterExit=no
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable first-boot-setup.service
+CHROOT
+
+say "Fin phase ISO. Redémarrage dans 3s..."
+sleep 3
+umount -R /mnt || true
+reboot
