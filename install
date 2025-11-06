@@ -23,34 +23,41 @@ ping -c1 archlinux.org >/dev/null 2>&1 || die "Pas d'accès réseau. Connecte le
 
 timedatectl set-ntp true
 
-say "Détection SanDisk 512Go (≈476 GiB), exclusion de la clé ISO"
-# Candidats : disques amovibles SanDisk ~476G; on exclut celui qui contient 'ARCH'/'ARCHISO'
-mapfile -t CAND < <(lsblk -dn -o NAME,SIZE,MODEL,TRAN,RM | awk '
-  /SanDisk/ && ($2 ~ /47[0-9]G|46[0-9]G|476G|465GiB/) {print $1}')
-# Exclure le device archiso
-FILTERED=()
-for n in "${CAND[@]}"; do
-  dev="/dev/$n"
-  if ! lsblk -no LABEL "$dev"* 2>/dev/null | grep -Ei 'ARCH|ARCHISO' >/dev/null; then
-    FILTERED+=("$n")
-  fi
-done
-CAND=("${FILTERED[@]}")
+say "Sélection du disque cible (supporte TARGET=sda)"
 
-[ "${#CAND[@]}" -eq 1 ] || die "Impossible d'identifier de façon sûre la SanDisk 512Go (trouvées: ${#CAND[@]}). Débranche les autres disques externes et relance."
-TARGET="/dev/${CAND[0]}"
+# Si l'utilisateur a fourni TARGET=sda ou TARGET=/dev/sda, on l'utilise
+if [ -n "${TARGET:-}" ]; then
+  TARGET="/dev/${TARGET##/dev/}"
+  say "Cible forcée via variable d'environnement: $TARGET"
+else
+  # 1) On essaie d'auto-détecter: disques amovibles (RM=1) qui NE portent pas ARCH/ARCHISO
+  mapfile -t DISKS < <(lsblk -dn -o NAME,RM | awk '$2==1{print $1}')
+  CAND=()
+  for n in "${DISKS[@]}"; do
+    dev="/dev/$n"
+    if ! lsblk -no LABEL "$dev"* 2>/dev/null | grep -Eqi 'ARCH|ARCHISO'; then
+      CAND+=("$n")
+    fi
+  done
+
+  if [ "${#CAND[@]}" -eq 1 ]; then
+    TARGET="/dev/${CAND[0]}"
+    say "Cible auto-détectée: $TARGET"
+  else
+    echo
+    echo "Disques amovibles détectés :"
+    lsblk -dn -o NAME,SIZE,MODEL,TRAN,RM
+    echo
+    read -rp "Tape le nom du disque à EFFACER (ex: sda): " ans
+    [ -n "$ans" ] || die "Aucun disque choisi."
+    TARGET="/dev/${ans##/dev/}"
+    read -rp "CONFIRMATION: EFFACER ${TARGET} ? (tape OUI pour continuer) : " ok
+    [ "$ok" = "OUI" ] || die "Annulé par l'utilisateur."
+  fi
+fi
+
 say "Cible retenue : $TARGET"
 
-# Partitionnement GPT : EFI 1G + ROOT (reste)
-say "Partitionnement & formatage (EFFACE TOUT sur $TARGET)"
-wipefs -af "$TARGET"
-sgdisk -Zo "$TARGET"
-partprobe "$TARGET"
-sgdisk -n1:0:+1G -t1:ef00 -c1:"EFI"  "$TARGET"
-sgdisk -n2:0:0    -t2:8300 -c2:"ROOT" "$TARGET"
-partprobe "$TARGET"
-
-P1="${TARGET}1"
 P2="${TARGET}2"
 
 mkfs.vfat -F32 -n EFI "$P1"
