@@ -58,6 +58,8 @@ fi
 
 say "Cible retenue : $TARGET"
 
+# définir les variables de partitions (EFI et ROOT)
+P1="${TARGET}1"
 P2="${TARGET}2"
 
 mkfs.vfat -F32 -n EFI "$P1"
